@@ -126,3 +126,26 @@ vips__bgra2rgba(guint32 *restrict p, int n)
 		p[x] = GUINT32_TO_BE(rgba);
 	}
 }
+
+/*
+ * Convert from Cairo-style premultiplied RGBA128F to straight RGBA, for one row.
+ *
+ * Processes ''n'' pixels in the ''p'' buffer.
+ * The data is assumed to be RGBA (R, G, B, A) 32-bit floats per pixel.
+ */
+void
+vips__premultiplied_rgb1282scrgba(float *restrict p, int n)
+{
+	for (int x = 0; x < n; x++) {
+		float r = p[0];
+		float g = p[1];
+		float b = p[2];
+		float a = p[3];
+
+		p[0] = a > 0.00001 ? r / a : 0.0F;
+		p[1] = a > 0.00001 ? g / a : 0.0F;
+		p[2] = a > 0.00001 ? b / a : 0.0F;
+
+		p += 4;
+	}
+}

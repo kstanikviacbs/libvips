@@ -421,6 +421,7 @@ if librsvg_found
     external_deps += librsvg_dep
     external_deps += cairo_dep
     cfg_var.set('HAVE_RSVG', '1')
+    cfg_var.set('HAVE_CAIRO_FORMAT_RGBA128F', cc.has_type('CAIRO_FORMAT_RGBA128F', dependencies: cairo_dep, prefix: '#include <cairo.h>'))
 endif
 
 openslide_dep = dependency('openslide', version: '>=3.3.0', required: get_option('openslide'))

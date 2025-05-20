@@ -28,6 +28,8 @@
  * 	- support rsvg_handle_get_intrinsic_size_in_pixels()
  * 5/6/22
  * 	- allow random access
+ * 20/5/25
+ *  - support high bit depth rendering (128-bit)
  */
 
 /*
@@ -118,6 +120,10 @@ typedef struct _VipsForeignLoadSvg {
 	/* Allow SVGs of any size.
 	 */
 	gboolean unlimited;
+
+	/* Enables scRGB 128-bit output (32-bit per channel).
+	 */
+	gboolean high_bitdepth;
 
 	RsvgHandle *page;
 
@@ -323,6 +329,26 @@ vips_foreign_load_svg_dispose(GObject *gobject)
 	VIPS_UNREF(svg->page);
 
 	G_OBJECT_CLASS(vips_foreign_load_svg_parent_class)->dispose(gobject);
+}
+
+static int
+vips_foreign_load_svg_build(VipsObject *object)
+{
+	VipsForeignLoadSvg *svg G_GNUC_UNUSED = (VipsForeignLoadSvg *) object;
+
+#ifdef DEBUG
+	printf("vips_foreign_load_svg_build:\n");
+#endif /*DEBUG*/
+
+#ifndef HAVE_CAIRO_FORMAT_RGBA128F
+	if (svg->high_bitdepth) {
+		g_warning("ignoring high_bitdepth");
+		svg->high_bitdepth = FALSE;
+	}
+#endif /*HAVE_CAIRO_FORMAT_RGBA128F*/
+
+	return VIPS_OBJECT_CLASS(vips_foreign_load_svg_parent_class)
+		->build(object);
 }
 
 static VipsForeignFlags
@@ -550,9 +576,11 @@ vips_foreign_load_svg_parse(VipsForeignLoadSvg *svg, VipsImage *out)
 	res = svg->dpi / 25.4;
 
 	vips_image_init_fields(out,
-		width, height,
-		4, VIPS_FORMAT_UCHAR,
-		VIPS_CODING_NONE, VIPS_INTERPRETATION_sRGB, res, res);
+		width, height, 4,
+		svg->high_bitdepth ? VIPS_FORMAT_FLOAT : VIPS_FORMAT_UCHAR,
+		VIPS_CODING_NONE,
+		svg->high_bitdepth ? VIPS_INTERPRETATION_scRGB : VIPS_INTERPRETATION_sRGB,
+		res, res);
 
 	/* We use a tilecache, so it's smalltile.
 	 */
@@ -593,9 +621,15 @@ vips_foreign_load_svg_generate(VipsRegion *out_region,
 	 */
 	vips_region_black(out_region);
 
+#ifdef HAVE_CAIRO_FORMAT_RGBA128F
+	cairo_format_t format = svg->high_bitdepth ? CAIRO_FORMAT_RGBA128F : CAIRO_FORMAT_ARGB32;
+#else
+	cairo_format_t format = CAIRO_FORMAT_ARGB32;
+#endif /*HAVE_CAIRO_FORMAT_RGBA128F*/
+
 	surface = cairo_image_surface_create_for_data(
 		VIPS_REGION_ADDR(out_region, r->left, r->top),
-		CAIRO_FORMAT_ARGB32,
+		format,
 		r->width, r->height,
 		VIPS_REGION_LSKIP(out_region));
 	cr = cairo_create(surface);
@@ -648,13 +682,23 @@ vips_foreign_load_svg_generate(VipsRegion *out_region,
 	cairo_destroy(cr);
 
 #endif /*LIBRSVG_CHECK_VERSION(2, 46, 0)*/
-
-	/* Cairo makes pre-multipled BRGA -- we must byteswap and unpremultiply.
-	 */
-	for (y = 0; y < r->height; y++)
-		vips__premultiplied_bgra2rgba(
-			(guint32 *) VIPS_REGION_ADDR(out_region, r->left, r->top + y),
-			r->width);
+	if (svg->high_bitdepth) {
+		/* Assuming the surface is RGBA128F and the data is premultiplied.
+		   Loop through each row and unpremultiply the float data.
+		*/
+		for (y = 0; y < r->height; y++)
+			vips__premultiplied_rgb1282scrgba(
+				(float *) VIPS_REGION_ADDR(out_region, r->left, r->top + y),
+				r->width);
+	}
+	else {
+		/* Cairo makes pre-multipled BRGA -- we must byteswap and unpremultiply.
+		 */
+		for (y = 0; y < r->height; y++)
+			vips__premultiplied_bgra2rgba(
+				(guint32 *) VIPS_REGION_ADDR(out_region, r->left, r->top + y),
+				r->width);
+	}
 
 	return 0;
 }
@@ -676,11 +720,17 @@ vips_foreign_load_svg_load(VipsForeignLoad *load)
 			"tile_width", TILE_SIZE,
 			"tile_height", TILE_SIZE,
 			"max_tiles", 2 * (1 + t[0]->Xsize / TILE_SIZE),
-			NULL) ||
-		vips_image_write(t[1], load->real))
+			NULL))
 		return -1;
 
-	return 0;
+	VipsImage *in = t[1];
+	if (svg->high_bitdepth) {
+		if (vips_gamma(in, &t[2], NULL))
+			return -1;
+		in = t[2];
+	}
+
+	return vips_image_write(in, load->real);
 }
 
 static void
@@ -698,6 +748,7 @@ vips_foreign_load_svg_class_init(VipsForeignLoadSvgClass *class)
 
 	object_class->nickname = "svgload_base";
 	object_class->description = _("load SVG with rsvg");
+	object_class->build = vips_foreign_load_svg_build;
 
 	/* librsvg has not been fuzzed, so should not be used with
 	 * untrusted input unless you are very careful.
@@ -732,6 +783,13 @@ vips_foreign_load_svg_class_init(VipsForeignLoadSvgClass *class)
 		_("Allow SVG of any size"),
 		VIPS_ARGUMENT_OPTIONAL_INPUT,
 		G_STRUCT_OFFSET(VipsForeignLoadSvg, unlimited),
+		FALSE);
+
+	VIPS_ARG_BOOL(class, "high_bitdepth", 25,
+		_("High bitdepth"),
+		_("Enable scRGB 128-bit output (32-bit per channel)"),
+		VIPS_ARGUMENT_OPTIONAL_INPUT,
+		G_STRUCT_OFFSET(VipsForeignLoadSvg, high_bitdepth),
 		FALSE);
 }
 
@@ -1010,16 +1068,11 @@ vips_foreign_load_svg_buffer_init(VipsForeignLoadSvgBuffer *buffer)
  * vips_svgload:
  * @filename: file to load
  * @out: (out): output image
- * @...: %NULL-terminated list of optional named arguments
+ * @...: `NULL`-terminated list of optional named arguments
  *
- * Optional arguments:
+ * Render a SVG file into a VIPS image.
  *
- * * @dpi: %gdouble, render at this DPI
- * * @scale: %gdouble, scale render by this factor
- * * @unlimited: %gboolean, allow SVGs of any size
- *
- * Render a SVG file into a VIPS image.  Rendering uses the librsvg library
- * and should be fast.
+ * Rendering uses the librsvg library and should be fast.
  *
  * Use @dpi to set the rendering resolution. The default is 72. You can also
  * scale the rendering by @scale.
@@ -1030,7 +1083,21 @@ vips_foreign_load_svg_buffer_init(VipsForeignLoadSvgBuffer *buffer)
  * SVGs larger than 10MB are normally blocked for security. Set @unlimited to
  * allow SVGs of any size.
  *
- * See also: vips_image_new_from_file().
+ * A UTF-8 string containing custom CSS can be provided via @stylesheet.
+ * During the CSS cascade, the specified stylesheet will be applied with a
+ * User Origin. This feature requires librsvg 2.48.0 or later.
+ *
+ * Setting @high_bitdepth TRUE enables 128-bit scRGB output."
+ *
+ * ::: tip "Optional arguments"
+ *     * @dpi: `gdouble`, render at this DPI
+ *     * @scale: `gdouble`, scale render by this factor
+ *     * @unlimited: `gboolean`, allow SVGs of any size
+ *     * @stylesheet: `gchararray`, custom CSS
+ *     * @high_bitdepth: `gboolean`, enable scRGB 128-bit output
+ *
+ * ::: seealso
+ *     [ctor@Image.new_from_file].
  *
  * Returns: 0 on success, -1 on error.
  */
@@ -1052,21 +1119,23 @@ vips_svgload(const char *filename, VipsImage **out, ...)
  * @buf: (array length=len) (element-type guint8): memory area to load
  * @len: (type gsize): size of memory area
  * @out: (out): image to write
- * @...: %NULL-terminated list of optional named arguments
- *
- * Optional arguments:
- *
- * * @dpi: %gdouble, render at this DPI
- * * @scale: %gdouble, scale render by this factor
- * * @unlimited: %gboolean, allow SVGs of any size
+ * @...: `NULL`-terminated list of optional named arguments
  *
  * Read a SVG-formatted memory block into a VIPS image. Exactly as
- * vips_svgload(), but read from a memory buffer.
+ * [ctor@Image.svgload], but read from a memory buffer.
  *
  * You must not free the buffer while @out is active. The
- * #VipsObject::postclose signal on @out is a good place to free.
+ * [signal@Object::postclose] signal on @out is a good place to free.
  *
- * See also: vips_svgload().
+ * ::: tip "Optional arguments"
+ *     * @dpi: `gdouble`, render at this DPI
+ *     * @scale: `gdouble`, scale render by this factor
+ *     * @unlimited: `gboolean`, allow SVGs of any size
+ *     * @stylesheet: `gchararray`, custom CSS
+ *     * @high_bitdepth: `gboolean`, enable scRGB 128-bit output
+ *
+ * ::: seealso
+ *     [ctor@Image.svgload].
  *
  * Returns: 0 on success, -1 on error.
  */
@@ -1096,16 +1165,18 @@ vips_svgload_buffer(void *buf, size_t len, VipsImage **out, ...)
  * @out: (out): image to write
  * @...: %NULL-terminated list of optional named arguments
  *
- * Optional arguments:
+ * Exactly as [ctor@Image.svgload], but read from a string. This function
+ * takes a copy of the string.
  *
- * * @dpi: %gdouble, render at this DPI
- * * @scale: %gdouble, scale render by this factor
- * * @unlimited: %gboolean, allow SVGs of any size
+ * ::: tip "Optional arguments"
+ *     * @dpi: `gdouble`, render at this DPI
+ *     * @scale: `gdouble`, scale render by this factor
+ *     * @unlimited: `gboolean`, allow SVGs of any size
+ *     * @stylesheet: `gchararray`, custom CSS
+ *     * @high_bitdepth: `gboolean`, enable scRGB 128-bit output
  *
- * Exactly as vips_svgload(), but read from a string. This function takes a
- * copy of the string.
- *
- * See also: vips_svgload().
+ * ::: seealso
+ *     [ctor@Image.svgload].
  *
  * Returns: 0 on success, -1 on error.
  */
@@ -1133,11 +1204,12 @@ vips_svgload_string(const char *str, VipsImage **out, ...)
  * vips_svgload_source:
  * @source: source to load from
  * @out: (out): image to write
- * @...: %NULL-terminated list of optional named arguments
+ * @...: `NULL`-terminated list of optional named arguments
  *
- * Exactly as vips_svgload(), but read from a source.
+ * Exactly as [ctor@Image.svgload], but read from a source.
  *
- * See also: vips_svgload().
+ * ::: seealso
+ *     [ctor@Image.svgload].
  *
  * Returns: 0 on success, -1 on error.
  */
